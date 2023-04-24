@@ -2,6 +2,8 @@
   <dictionary name="shafner">
     <words>
       <w>patchify</w>
+      <w>segmenter</w>
+      <w>upsample</w>
     </words>
   </dictionary>
 </component>

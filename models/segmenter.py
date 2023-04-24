@@ -126,7 +126,7 @@ class MaskTransformer(nn.Module):
         self.decoder_norm = nn.LayerNorm(d_model)
         self.mask_norm = nn.LayerNorm(n_cls)
 
-    def forward(self, x, im_size):
+    def forward(self, x: torch.Tensor, im_size: Tuple[int, int]):
         H, W = im_size
         GS = H // self.patch_size
 
@@ -148,42 +148,54 @@ class MaskTransformer(nn.Module):
         masks = self.mask_norm(masks)
         masks = einops.rearrange(masks, "b (h w) n -> b n h w", h=int(GS))
 
+        masks = F.interpolate(masks, size=(H, W), mode="bilinear")
+
         return masks
 
 
+# https://github.com/isaaccorley/segmenter-pytorch/blob/main/segmenter/segmenter.py
 class MaskTransformerV2(nn.Module):
 
-    def __init__(self, n_cls: int, n_layers: int, n_heads: int, d_model: int):
+    def __init__(self, n_cls: int, patch_size: int, n_layers: int, n_heads: int, d_model: int):
         super(MaskTransformerV2, self).__init__()
         self.n_cls = n_cls
+        self.patch_size = patch_size
         self.cls_tokens = nn.Parameter(torch.randn(1, n_cls, d_model))
         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
                                            activation="gelu")
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.upsample = nn.Upsample(scale_factor=patch_size, mode="bilinear")
+        self.scale = d_model ** -0.5
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, im_size: Tuple[int, int]) -> torch.Tensor:
+        H, W = im_size
         b = x.shape[0]
         cls_tokens = self.cls_tokens.repeat(b, 1, 1)
         x = torch.cat([cls_tokens, x], dim=1)
         x = self.transformer(x)
-        c = x[:, :self.num_classes]
-        z = x[:, self.num_classes:]
-        out = z @ c.transpose(1, 2)
-        out = torch.softmax(out / self.scale, dim=-1)
-        return out
+        c = x[:, :self.n_cls]
+        z = x[:, self.n_cls:]
+        masks = z @ c.transpose(1, 2)
+        masks = torch.softmax(masks / self.scale, dim=-1)
+
+        masks = einops.rearrange(masks, "b (p1 p2) c -> b c p1 p2", p1=H // self.patch_size, p2=W // self.patch_size)
+
+        masks = self.upsample(masks)
+
+        return masks
 
 
 class Segmenter(nn.Module):
-    def __init__(self, chw, n_patches=7, n_blocks=2, hidden_d=8, n_heads=2, n_cls=2, decoder_type='linear'):
+    def __init__(self, chw, n_patches=7, n_layers=2, d_model=8, n_heads=2, n_cls=2, decoder_type='linear'):
         # Super constructor
         super(Segmenter, self).__init__()
 
         # Attributes
         self.chw = chw  # ( C , H , W )
         self.n_patches = n_patches
-        self.n_blocks = n_blocks
+        self.n_layers = n_layers
         self.n_heads = n_heads
-        self.hidden_d = hidden_d
+        self.d_model = d_model
 
         # Input and patches sizes
         assert(chw[1] == chw[2])
@@ -192,25 +204,25 @@ class Segmenter(nn.Module):
 
         # 1) Linear mapper
         self.input_d = int(chw[0] * self.patch_size**2)
-        self.linear_mapper = nn.Linear(self.input_d, self.hidden_d)
+        self.linear_mapper = nn.Linear(self.input_d, d_model)
 
         # 2) Learnable classification token
-        self.class_token = nn.Parameter(torch.rand(1, self.hidden_d))
+        self.class_token = nn.Parameter(torch.rand(1, d_model))
 
         # 3) Positional embedding
-        self.register_buffer('positional_embeddings', get_positional_embeddings(n_patches ** 2 + 1, hidden_d),
+        self.register_buffer('positional_embeddings', get_positional_embeddings(n_patches ** 2 + 1, d_model),
                              persistent=False)
 
         # 4) Transformer encoder blocks
-        self.blocks = nn.ModuleList([ViTBlock(hidden_d, n_heads) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([ViTBlock(d_model, n_heads) for _ in range(n_layers)])
 
         # 5) Decoding
         if decoder_type == 'linear':
-            self.decoder = LinearDecoder(n_cls, self.patch_size, hidden_d)
+            self.decoder = LinearDecoder(n_cls, self.patch_size, d_model)
         elif decoder_type == 'mask_transformer':
-            self.decoder = MaskTransformer(n_cls, self.patch_size, n_blocks, n_heads, hidden_d)
+            self.decoder = MaskTransformer(n_cls, self.patch_size, n_layers, n_heads, d_model)
         elif decoder_type == 'mask_transformer_v2':
-            self.decoder = MaskTransformerV2(n_cls, n_blocks, n_heads, hidden_d)
+            self.decoder = MaskTransformerV2(n_cls, self.patch_size, n_layers, n_heads, d_model)
         else:
             raise Exception(f'Unkown decoder type ({decoder_type})')
 
@@ -237,7 +249,5 @@ class Segmenter(nn.Module):
         out = out[:, :-1]
 
         out = self.decoder(out, (h, w))
-
-        out = F.interpolate(out, size=(h, w), mode="bilinear")
 
         return out
