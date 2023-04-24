@@ -103,6 +103,7 @@ class LinearDecoder(nn.Module):
         GS = H // self.patch_size
         x = self.head(x)
         x = einops.rearrange(x, "b (h w) c -> b c h w", h=GS)
+        x = F.interpolate(x, size=(H, W), mode="bilinear")
         return x
 
 

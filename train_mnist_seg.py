@@ -42,7 +42,7 @@ def main():
 
 
     # model = unet.UNet(n_channels=1, n_classes=2)
-    model = segmenter.Segmenter((1, 28, 28), decoder_type='mask_transformer_v2')
+    model = segmenter.Segmenter((1, 28, 28), decoder_type='linear')
 
     N_EPOCHS = 2
     LR = 0.0001
