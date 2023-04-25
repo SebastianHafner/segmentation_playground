@@ -1,6 +1,9 @@
 <component name="ProjectDictionaryState">
   <dictionary name="shafner">
     <words>
+      <w>gelu</w>
+      <w>jaccard</w>
+      <w>logits</w>
       <w>patchify</w>
       <w>segmenter</w>
       <w>upsample</w>

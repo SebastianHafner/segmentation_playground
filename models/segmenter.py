@@ -80,7 +80,7 @@ class ViTBlock(nn.Module):
         return out
 
 
-def get_positional_embeddings(sequence_length, d):
+def get_positional_encodings(sequence_length, d):
     result = torch.ones(sequence_length, d)
     for i in range(sequence_length):
         for j in range(d):
@@ -98,12 +98,31 @@ class LinearDecoder(nn.Module):
 
         self.head = nn.Linear(hidden_d, n_cls)
 
-    def forward(self, x, im_size):
+    def forward(self, x, im_size: Tuple[int, int]) -> torch.Tensor:
         H, W = im_size
         GS = H // self.patch_size
         x = self.head(x)
         x = einops.rearrange(x, "b (h w) c -> b c h w", h=GS)
         x = F.interpolate(x, size=(H, W), mode="bilinear")
+        return x
+
+
+class LinearDecoderV2(nn.Module):
+    def __init__(self, n_cls, patch_size, hidden_d):
+        super(LinearDecoderV2, self).__init__()
+
+        self.hidden_d = hidden_d
+        self.patch_size = patch_size
+        self.n_cls = n_cls
+
+        self.head = nn.Linear(hidden_d, patch_size**2)
+
+    def forward(self, x, im_size):
+        H, W = im_size
+        GS = H // self.patch_size
+        x = self.head(x)
+        x = einops.rearrange(x, "b (h w) c -> b c h w", h=GS)
+        x = self.upsample(x)
         return x
 
 
@@ -127,7 +146,7 @@ class MaskTransformer(nn.Module):
         self.decoder_norm = nn.LayerNorm(d_model)
         self.mask_norm = nn.LayerNorm(n_cls)
 
-    def forward(self, x: torch.Tensor, im_size: Tuple[int, int]):
+    def forward(self, x: torch.Tensor, im_size: Tuple[int, int]) -> torch.Tensor:
         H, W = im_size
         GS = H // self.patch_size
 
@@ -186,6 +205,55 @@ class MaskTransformerV2(nn.Module):
         return masks
 
 
+class MaskTransformerV3(nn.Module):
+    def __init__(self, n_cls, patch_size, n_layers, n_heads, d_model):
+        super(MaskTransformerV3, self).__init__()
+        self.patch_size = patch_size
+        self.n_layers = n_layers
+        self.n_cls = n_cls
+        self.d_model = d_model  # == d_encoder
+        self.scale = d_model ** -0.5
+
+        # mask transformer
+        transformer_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+                                                       batch_first=True, activation='gelu')
+        self.mask_transformer = nn.TransformerEncoder(transformer_layer, n_layers)
+
+        self.cls_emb = nn.Parameter(torch.randn(1, n_cls, d_model))
+        self.proj_dec = nn.Linear(d_model, d_model)
+
+        self.proj_patch = nn.Parameter(self.scale * torch.randn(d_model, d_model))
+        self.proj_classes = nn.Parameter(self.scale * torch.randn(d_model, d_model))
+
+        self.decoder_norm = nn.LayerNorm(d_model)
+        self.mask_norm = nn.LayerNorm(n_cls)
+
+    def forward(self, x: torch.Tensor, im_size: Tuple[int, int]) -> torch.Tensor:
+        H, W = im_size
+        GS = H // self.patch_size
+
+        x = self.proj_dec(x)
+        cls_emb = self.cls_emb.expand(x.size(0), -1, -1)
+        x = torch.cat((x, cls_emb), 1)
+        x = self.mask_transformer(x)
+        x = self.decoder_norm(x)
+
+        patches, cls_seg_feat = x[:, : -self.n_cls], x[:, -self.n_cls:]
+        patches = patches @ self.proj_patch
+        cls_seg_feat = cls_seg_feat @ self.proj_classes
+
+        patches = patches / patches.norm(dim=-1, keepdim=True)
+        cls_seg_feat = cls_seg_feat / cls_seg_feat.norm(dim=-1, keepdim=True)
+
+        masks = patches @ cls_seg_feat.transpose(1, 2)
+        masks = self.mask_norm(masks)
+        masks = einops.rearrange(masks, "b (h w) n -> b n h w", h=int(GS))
+
+        masks = F.interpolate(masks, size=(H, W), mode="bilinear")
+
+        return masks
+
+
 class Segmenter(nn.Module):
     def __init__(self, chw, n_patches=7, n_layers=2, d_model=8, n_heads=2, n_cls=2, decoder_type='linear'):
         # Super constructor
@@ -211,7 +279,7 @@ class Segmenter(nn.Module):
         self.class_token = nn.Parameter(torch.rand(1, d_model))
 
         # 3) Positional embedding
-        self.register_buffer('positional_embeddings', get_positional_embeddings(n_patches ** 2 + 1, d_model),
+        self.register_buffer('positional_encodings', get_positional_encodings(n_patches ** 2 + 1, d_model),
                              persistent=False)
 
         # 4) Transformer encoder blocks
@@ -239,8 +307,8 @@ class Segmenter(nn.Module):
         # Adding classification token to the tokens
         tokens = torch.cat((self.class_token.expand(n, 1, -1), tokens), dim=1)
 
-        # Adding positional embedding
-        out = tokens + self.positional_embeddings.repeat(n, 1, 1)
+        # Adding positional encodings
+        out = tokens + self.positional_encodings.repeat(n, 1, 1)
 
         # Transformer Blocks
         for block in self.blocks:
@@ -248,6 +316,67 @@ class Segmenter(nn.Module):
 
         # Removing the classification token
         out = out[:, :-1]
+
+        out = self.decoder(out, (h, w))
+
+        return out
+
+
+class SegmenterV2(nn.Module):
+    def __init__(self, chw, patch_size=4, n_layers=2, d_model=192, n_heads=3, n_cls=2, decoder_type='linear'):
+        # Super constructor
+        super(SegmenterV2, self).__init__()
+
+        # attributes
+        self.chw = chw  # ( C , H , W )
+        self.patch_size = patch_size
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.d_model = d_model
+
+        # input and n patches
+        assert (chw[1] == chw[2] and chw[1] % patch_size == 0)
+        self.n_patches = chw[1] // self.patch_size
+
+        # linear mapper
+        self.input_d = int(chw[0] * self.patch_size ** 2)
+        self.linear_mapper = nn.Linear(self.input_d, d_model)
+
+        # positional embedding
+        self.register_buffer('positional_encodings', get_positional_encodings(self.n_patches ** 2, d_model),
+                             persistent=False)
+
+        # transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=4*d_model,
+                                                   batch_first=True, activation='gelu')
+        self.encoder = nn.TransformerEncoder(encoder_layer, n_layers)
+
+        # decoding
+        if decoder_type == 'linear':
+            self.decoder = LinearDecoder(n_cls, patch_size, d_model)
+        elif decoder_type == 'mask_transformer':
+            self.decoder = MaskTransformer(n_cls, patch_size, n_layers, n_heads, d_model)
+        elif decoder_type == 'mask_transformer_v2':
+            self.decoder = MaskTransformerV2(n_cls, patch_size, n_layers, n_heads, d_model)
+        elif decoder_type == 'mask_transformer_v3':
+            self.decoder = MaskTransformerV3(n_cls, patch_size, n_layers, n_heads, d_model)
+        else:
+            raise Exception(f'Unkown decoder type ({decoder_type})')
+
+    def forward(self, images):
+        # Dividing images into patches
+        n, c, h, w = images.shape
+        patches = patchify(images, self.n_patches).to(self.positional_encodings.device)
+
+        # running linear layer tokenization
+        # map the vector corresponding to each patch to the hidden size dimension
+        tokens = self.linear_mapper(patches)
+
+        # adding positional encoding
+        out = tokens + self.positional_encodings.repeat(n, 1, 1)
+
+        # transformer encoder
+        out = self.encoder(out)
 
         out = self.decoder(out, (h, w))
 

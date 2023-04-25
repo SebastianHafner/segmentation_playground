@@ -21,9 +21,21 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 
-def produce_label(x: torch.tensor) -> torch.tensor:
-    y_seg = torch.argmax((x > 0.5).float(), dim=1).long()
-    return y_seg
+def power_jaccard_loss(logits: torch.Tensor, y: torch.Tensor):
+    y_hat = torch.sigmoid(logits)
+    eps = 1e-6
+    y_hat, y = y_hat.flatten(), y.flatten()
+    intersection = (y_hat * y).sum()
+    denom = (y_hat ** 2 + y ** 2).sum() - (y_hat * y).sum() + eps
+    return 1 - (intersection / denom)
+
+
+def produce_label(x: torch.tensor, softmax: bool = True) -> torch.tensor:
+    y_seg = x > 0.5
+    if softmax:
+        return y_seg.squeeze().long()
+    else:
+        return y_seg.float()
 
 
 def main():
@@ -41,8 +53,8 @@ def main():
     print("Using device: ", device, f"({torch.cuda.get_device_name(device)})" if torch.cuda.is_available() else "")
 
 
-    # model = unet.UNet(n_channels=1, n_classes=2)
-    model = segmenter.Segmenter((1, 28, 28), decoder_type='linear')
+    # model = unet.UNet(n_channels=1, n_classes=1)
+    model = segmenter.SegmenterV2((1, 28, 28), decoder_type='mask_transformer_v3', n_cls=1)
 
     N_EPOCHS = 2
     LR = 0.0001
@@ -52,8 +64,8 @@ def main():
 
     # Training loop
     optimizer = Adam(model.parameters(), lr=LR)
-    # criterion = CrossEntropyLoss()
-    criterion = nn.CrossEntropyLoss()
+    criterion = power_jaccard_loss
+    # criterion = nn.CrossEntropyLoss()
     model.to(device)
     model.train()
     for epoch in range(N_EPOCHS):
@@ -62,7 +74,7 @@ def main():
             x, y = batch
             x, y = x.to(device), y.to(device)
             # x = x.repeat(1, 3, 1, 1)
-            y_seg = produce_label(x)
+            y_seg = produce_label(x, softmax=False)
 
             y_hat = model(x)
             loss = criterion(y_hat, y_seg)
